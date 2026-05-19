@@ -1,18 +1,31 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <syslog.h> 
+ 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <syslog.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/queue.h>
+
+
+// see BSD implementation in https://github.com/openembedded/openembedded-core/blob/master/meta/recipes-core/musl/bsd-headers/sys-queue.h#L132
+#define SLIST_FOREACH_SAFE(var, head, field, tvar)                      \
+    for ((var) = SLIST_FIRST((head));                                   \
+         (var) && ((tvar) = SLIST_NEXT((var), field), 1);               \
+         (var) = (tvar))
+
 
 #define PORT_STR    "9000"
 #define LISTEN_BACKLOG 50
@@ -22,9 +35,10 @@
 
 #define EXIT_ERR_CODE -1
 
-static void handle_client(int client_fd, const char *client_ip);
+static void* handle_client(void* args);
 static void signal_handler(int signo);
 static int setup_signals(void);
+static int write_to_file(int fd, const char *buf, size_t len);
 static int send_file_to_client(int client_fd);
 
 static volatile sig_atomic_t m_shutdown = 0;
@@ -32,6 +46,55 @@ static volatile sig_atomic_t m_shutdown = 0;
 static char    m_send_file_buf[BUFFER_SIZE];
 static char    m_recv_from_client_buf[BUFFER_SIZE];
 static char    m_pkt_buf[BUFFER_SIZE * 8];
+
+static pthread_mutex_t m_file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Each accepted connection gets one thread_node.
+ * The node is allocated before pthread_create and freed after pthread_join.
+ */
+typedef struct thread_node {
+    pthread_t                thread;
+    int                      client_fd;
+    SLIST_ENTRY(thread_node) entries;
+} thread_node_t;
+
+/* Head type for the singly-linked list. */
+SLIST_HEAD(thread_list, thread_node);
+
+/* The list and its protecting mutex are only accessed from the main thread,
+ * so no additional lock is needed for the list itself. */
+static struct thread_list g_threads = SLIST_HEAD_INITIALIZER(g_threads);
+
+static pthread_t          m_timer_thread;
+
+#define TIMESTAMP_INTERVAL_S 10
+
+/*
+ * Every 10 seconds wake up and append RFC 2822 timestamp to OUTPUT_FILE
+ *
+ * Format:
+ *   timestamp:Tue, 19 May 2026 00:01:02 +0000
+ *
+ * The thread exits cleanly when m_shutdown is set.
+ */
+
+static void *timer_thread(void *arg);\
+
+/*
+ * Reap any threads that have already finished.
+ * Called from the main thread before and after the accept loop.
+ * Uses SLIST_FOREACH_SAFE so we can remove while iterating.
+ */
+static void reap_finished_threads(void);
+ 
+/*
+ * Join ALL remaining threads unconditionally.
+ * Called during shutdown after closing the server socket.
+ * Closing client_fd from the main thread is not done here — each thread
+ * closes its own fd on exit, so we only need to wait.
+ */
+static void join_all_threads(void);
 
 int main(int argc, char *argv[])
 {
@@ -138,8 +201,21 @@ int main(int argc, char *argv[])
         }
     }
 
+    int rc = pthread_create(&m_timer_thread, NULL, timer_thread, NULL);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_create(timer_thread)");
+        return EXIT_ERR_CODE;
+    }
+
+
     while(1)
     {
+        /* Opportunistically reap threads that have already finished. */
+        reap_finished_threads();
+
+        if (m_shutdown) break;
+
         struct sockaddr_storage client_addr;
         socklen_t client_len = sizeof(client_addr);
  
@@ -171,7 +247,26 @@ int main(int argc, char *argv[])
 
         syslog(LOG_INFO, "Accepted connection from %s\n",  client_ip);
 
-        handle_client(client_fd, client_ip);
+        /* Allocate a node; initialise it; add to list; spawn thread. */
+        thread_node_t *node = malloc(sizeof(thread_node_t));
+        if (node == NULL) {
+            perror("malloc thread_node");
+            close(client_fd);
+            continue;
+        }
+ 
+        node->client_fd   = client_fd;
+ 
+        int rc = pthread_create(&node->thread, NULL, handle_client, node);
+        if (rc != 0) {
+            errno = rc;
+            perror("pthread_create(handle_client)");
+            free(node);
+            close(client_fd);
+            continue;
+        }
+ 
+        SLIST_INSERT_HEAD(&g_threads, node, entries);
 
         if (m_shutdown) break;
     }
@@ -180,6 +275,13 @@ int main(int argc, char *argv[])
 
     close(server_fd);
     
+    /* Wait for the timer thread to notice m_shutdown and exit. */
+    pthread_join(m_timer_thread, NULL);
+
+    join_all_threads();
+ 
+    pthread_mutex_destroy(&m_file_mutex);
+
     //delete file
     if (unlink(OUTPUT_FILE) == -1 && errno != ENOENT)
     {
@@ -189,6 +291,106 @@ int main(int argc, char *argv[])
     closelog();
 
     return EXIT_SUCCESS;
+}
+
+static void *timer_thread(void *arg)
+{
+    (void)arg;
+ 
+    while (!m_shutdown) {
+        /* Sleep in 1-second increments so we notice m_shutdown promptly. */
+        for (int i = 0; i < TIMESTAMP_INTERVAL_S && !m_shutdown; i++)
+        {
+            sleep(1);
+        }
+ 
+        if (m_shutdown)
+        {
+            break;
+        }
+ 
+        /* Build the RFC 2822 timestamp string. */
+        time_t     now = time(NULL);
+        struct tm  tm_buf;
+        char       ts[64];
+ 
+        localtime_r(&now, &tm_buf); //re-entrant
+ 
+        /* RFC 2822 date-time: "Tue, 19 May 2026 00:01:02 +0000" */
+        if (strftime(ts, sizeof(ts), "%a, %d %b %Y %H:%M:%S %z", &tm_buf) == 0)
+        {
+            syslog(LOG_ERR, "timer_thread: strftime failed");
+            continue;
+        }
+ 
+        /* Format the full line. */
+        char line[128];
+        int  len = snprintf(line, sizeof(line), "timestamp:%s\n", ts);
+        if (len < 0 || (size_t)len >= sizeof(line))
+        {
+            syslog(LOG_ERR, "timer_thread: snprintf overflow");
+            continue;
+        }
+ 
+        pthread_mutex_lock(&m_file_mutex);
+ 
+        int file_fd = open(OUTPUT_FILE,
+                           O_WRONLY | O_CREAT | O_APPEND,
+                           S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        if (file_fd == -1)
+        {
+            syslog(LOG_ERR, "timer_thread: open(" OUTPUT_FILE "): %m");
+            pthread_mutex_unlock(&m_file_mutex);
+            continue;
+        }
+ 
+        if (write_to_file(file_fd, line, (size_t)len) == -1)
+        {
+            syslog(LOG_ERR, "timer_thread: write(" OUTPUT_FILE "): %m");
+        }
+ 
+        close(file_fd);
+        pthread_mutex_unlock(&m_file_mutex);
+ 
+        syslog(LOG_DEBUG, "Timestamp written: %s", ts);
+    }
+ 
+    return NULL;
+}
+
+/*
+ * Reap any threads that have already finished.
+ * Called from the main thread before and after the accept loop.
+ * Uses SLIST_FOREACH_SAFE so we can remove while iterating.
+ */
+static void reap_finished_threads(void)
+{
+    thread_node_t *node, *tmp;
+    SLIST_FOREACH_SAFE(node, &g_threads, entries, tmp) {
+        /* pthread_tryjoin_np is Linux-specific; use it to avoid blocking. */
+        if (pthread_tryjoin_np(node->thread, NULL) == 0) {
+            SLIST_REMOVE(&g_threads, node, thread_node, entries);
+            free(node);
+        }
+    }
+}
+ 
+/*
+ * Join ALL remaining threads unconditionally.
+ * Called during shutdown after closing the server socket.
+ * Closing client_fd from the main thread is not done here — each thread
+ * closes its own fd on exit, so we only need to wait.
+ */
+static void join_all_threads(void)
+{
+    thread_node_t *node, *tmp;
+    SLIST_FOREACH_SAFE(node, &g_threads, entries, tmp) {
+        /* Signal the client fd to unblock any blocking recv/send. */
+        shutdown(node->client_fd, SHUT_RDWR);
+        pthread_join(node->thread, NULL);
+        SLIST_REMOVE(&g_threads, node, thread_node, entries);
+        free(node);
+    }
 }
 
 static void signal_handler(int signum)
@@ -273,16 +475,22 @@ done:
     return ret;
 }
 
-static void handle_client(int client_fd, const char* client_ip)
+static void* handle_client(void* arg)
 {
+
+    thread_node_t *node      = (thread_node_t *)arg;
+    int client_fd = node->client_fd;
+
+    pthread_mutex_lock(&m_file_mutex);
     /* Open (or create) the output file in append mode. */
     int file_fd = open(OUTPUT_FILE,
                        O_WRONLY | O_CREAT | O_APPEND,
                        S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH); /* 0644 */
     if (file_fd == -1) {
         perror("open(" OUTPUT_FILE ")");
+        pthread_mutex_unlock(&m_file_mutex);
         close(client_fd);
-        return;
+        return NULL;
     }
  
     size_t  pkt_max_len = sizeof(m_pkt_buf);
@@ -303,6 +511,7 @@ static void handle_client(int client_fd, const char* client_ip)
                 // flush buffer. full
                 if (write_to_file(file_fd, m_pkt_buf, pkt_len) == -1) {
                     perror("write(" OUTPUT_FILE ") [buffer full]");
+                    pthread_mutex_unlock(&m_file_mutex);
                     io_err = 1;
                     break;
                 }
@@ -314,6 +523,7 @@ static void handle_client(int client_fd, const char* client_ip)
             if (*p == '\n') {
                 if (write_to_file(file_fd, m_pkt_buf, pkt_len) == -1) {
                     perror("write(" OUTPUT_FILE ") [newline]");
+                    pthread_mutex_unlock(&m_file_mutex);
                     io_err = 1;
                     break;
                 }
@@ -321,15 +531,18 @@ static void handle_client(int client_fd, const char* client_ip)
                 pkt_len = 0;
  
                 close(file_fd);
+                
                 file_fd = -1;
- 
+                
                 if (send_file_to_client(client_fd) == -1)
+                {
                     fprintf(stderr, "warning: send_file_to_client failed for fd=%d\n", client_fd);
- 
-                syslog(LOG_INFO, "Closed connection from %s\n", client_ip);
- 
+                }
+                pthread_mutex_unlock(&m_file_mutex);
+                
                 close(client_fd);
-                return;
+                syslog(LOG_INFO, "Closed connection from %d\n", client_fd);
+                return NULL;
             }
  
             p++;
@@ -344,5 +557,7 @@ static void handle_client(int client_fd, const char* client_ip)
         close(file_fd);
     
     close(client_fd);
-    syslog(LOG_INFO, "Closed connection from %s\n", client_ip);
+    syslog(LOG_INFO, "Closed connection from client fd:%d\n", client_fd);
+
+    return NULL;
 }
